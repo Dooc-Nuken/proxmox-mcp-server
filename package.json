@@ -1,0 +1,17 @@
+{
+  "name": "proxmox-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Proxmox VE — manage VMs, containers, nodes, snapshots and storage via any AI assistant.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "proxmox-mcp-server": "./server.ts"
+  },
+  "scripts": {
+    "start": "tsx server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "tsx": "^4.0.0"
+  }
+}

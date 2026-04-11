@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Allow self-signed certificates (Proxmox default)
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 /**
  * Proxmox VE MCP Server
  *
@@ -31,6 +29,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
+import { Agent as HttpsAgent } from 'node:https'
+import { request as httpsRequest } from 'node:https'
+import { request as httpRequest } from 'node:http'
 
 // ── Load .env if present ────────────────────────────────────────────────────
 
@@ -42,8 +43,20 @@ function loadEnv() {
   for (const path of locations) {
     try {
       for (const line of readFileSync(path, 'utf8').split('\n')) {
-        const m = line.match(/^([A-Z_0-9]+)=(.*)$/)
-        if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) continue
+        const m = trimmed.match(/^([A-Za-z_][A-Za-z_0-9]*)=(.*)$/)
+        if (!m) continue
+        let val = m[2].trim()
+        // Quoted values: strip quotes, preserve content as-is (including # characters)
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1)
+        } else {
+          // Unquoted: strip inline comments
+          const commentIdx = val.indexOf(' #')
+          if (commentIdx !== -1) val = val.slice(0, commentIdx).trim()
+        }
+        if (process.env[m[1]] === undefined) process.env[m[1]] = val
       }
       break
     } catch {}
@@ -106,53 +119,153 @@ function getHost(name?: string): PveHost {
   return h
 }
 
+// ── TLS configuration (scoped to Proxmox connections only) ─────────────────
+
+const insecureAgent = process.env.PROXMOX_INSECURE === '1'
+  ? new HttpsAgent({ rejectUnauthorized: false })
+  : undefined
+
+if (insecureAgent) {
+  process.stderr.write('proxmox-mcp-server: TLS verification disabled for Proxmox connections (PROXMOX_INSECURE=1)\n')
+}
+
+// ── Read-only mode ─────────────────────────────────────────────────────────
+
+const readOnly = process.env.PROXMOX_READ_ONLY === '1'
+
+const WRITE_TOOLS = new Set([
+  'start_vm', 'stop_vm', 'shutdown_vm', 'reboot_vm', 'suspend_vm', 'resume_vm',
+  'create_vm', 'clone_vm', 'delete_vm', 'convert_vm_to_template',
+  'update_vm_config', 'resize_vm_disk',
+  'set_vm_cloudinit', 'regenerate_cloudinit',
+  'exec_vm_command',
+  'migrate_vm',
+  'start_container', 'stop_container', 'shutdown_container', 'reboot_container',
+  'create_container', 'clone_container', 'delete_container', 'convert_container_to_template',
+  'update_container_config', 'resize_container_disk', 'migrate_container',
+  'create_snapshot', 'delete_snapshot', 'rollback_snapshot',
+  'backup_vm',
+  'add_firewall_rule',
+])
+
 // ── Proxmox API client ──────────────────────────────────────────────────────
+
+function pveRequest(urlStr: string, method: string, headers: Record<string, string>, bodyStr?: string): Promise<{ ok: boolean; status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(urlStr)
+    const isHttps = parsed.protocol === 'https:'
+    const reqFn = isHttps ? httpsRequest : httpRequest
+    const options: Record<string, unknown> = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method,
+      headers,
+      timeout: 10000,
+    }
+    if (isHttps && insecureAgent) {
+      options.agent = insecureAgent
+    }
+
+    const req = reqFn(options as never, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('end', () => {
+        resolve({ ok: res.statusCode! >= 200 && res.statusCode! < 300, status: res.statusCode!, body: Buffer.concat(chunks).toString() })
+      })
+    })
+
+    req.on('error', reject)
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')) })
+
+    if (bodyStr) req.write(bodyStr)
+    req.end()
+  })
+}
 
 async function pveApiFetch(baseUrl: string, host: PveHost, method: string, path: string, body?: Record<string, unknown>): Promise<{ ok: boolean; data: unknown; status: number; raw?: string }> {
   const url = `${baseUrl}/api2/json${path}`
   const headers: Record<string, string> = {
     'Authorization': `PVEAPIToken=${host.tokenId}=${host.tokenSecret}`,
   }
-  const opts: RequestInit = { method, headers, signal: AbortSignal.timeout(10000) }
 
+  let bodyStr: string | undefined
   if (body && method !== 'GET') {
     headers['Content-Type'] = 'application/x-www-form-urlencoded'
-    opts.body = new URLSearchParams(
+    bodyStr = new URLSearchParams(
       Object.entries(body).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => [k, String(v)])
     ).toString()
   }
 
-  const res = await fetch(url, opts)
-  const json = await res.json() as { data?: unknown; errors?: unknown }
+  const res = await pveRequest(url, method, headers, bodyStr)
+  const json = JSON.parse(res.body) as { data?: unknown; errors?: unknown }
   return { ok: res.ok, data: json.data, status: res.status, raw: JSON.stringify(json.errors ?? json) }
 }
 
 async function pveApi(host: PveHost, method: string, path: string, body?: Record<string, unknown>): Promise<unknown> {
+  let primaryError: Error | undefined
   try {
     const res = await pveApiFetch(host.url, host, method, path, body)
     if (res.ok) return res.data
+    // Auth errors are never retried on fallback
     if (res.status === 401 || res.status === 403) {
       throw new Error(`Proxmox API ${res.status} on ${host.name}: ${res.raw}`)
     }
+    primaryError = new Error(`Proxmox API ${res.status} on ${host.name}: ${res.raw}`)
   } catch (err: unknown) {
-    if (!host.fallbackUrl) throw err
     if (err instanceof Error && (err.message.includes('401') || err.message.includes('403'))) throw err
-    process.stderr.write(`proxmox-mcp-server: primary URL failed for ${host.name}, trying fallback...\n`)
+    primaryError = err instanceof Error ? err : new Error(String(err))
   }
 
   if (host.fallbackUrl) {
+    process.stderr.write(`proxmox-mcp-server: primary URL failed for ${host.name}, trying fallback...\n`)
     const res = await pveApiFetch(host.fallbackUrl, host, method, path, body)
     if (res.ok) return res.data
     throw new Error(`Proxmox API ${res.status} on ${host.name} (fallback): ${res.raw}`)
   }
 
-  throw new Error(`Proxmox API: all URLs failed for ${host.name}`)
+  throw primaryError ?? new Error(`Proxmox API: all URLs failed for ${host.name}`)
 }
 
 async function pveGet(host: PveHost, path: string) { return pveApi(host, 'GET', path) }
 async function pvePost(host: PveHost, path: string, body?: Record<string, unknown>) { return pveApi(host, 'POST', path, body) }
 async function pvePut(host: PveHost, path: string, body?: Record<string, unknown>) { return pveApi(host, 'PUT', path, body) }
 async function pveDelete(host: PveHost, path: string) { return pveApi(host, 'DELETE', path) }
+
+// ── Input validation ───────────────────────────────────────────────────────
+
+function validateIdentifier(value: unknown, label: string): string {
+  const s = String(value)
+  if (!/^[a-zA-Z0-9._-]+$/.test(s)) throw new Error(`Invalid ${label}: "${s}" — only alphanumeric, dots, hyphens, underscores allowed`)
+  return s
+}
+
+function validateVmid(value: unknown): number {
+  const n = Number(value)
+  if (!Number.isInteger(n) || n < 1 || n > 999999999) throw new Error(`Invalid vmid: ${value}`)
+  return n
+}
+
+const VALID_VM_TYPES = new Set(['qemu', 'lxc'])
+function validateVmType(value: unknown): string {
+  const s = String(value || 'qemu')
+  if (!VALID_VM_TYPES.has(s)) throw new Error(`Invalid type: "${s}" — must be qemu or lxc`)
+  return s
+}
+
+const VALID_TIMEFRAMES = new Set(['hour', 'day', 'week', 'month', 'year'])
+function validateTimeframe(value: unknown): string {
+  const s = String(value || 'hour')
+  if (!VALID_TIMEFRAMES.has(s)) throw new Error(`Invalid timeframe: "${s}"`)
+  return s
+}
+
+function validatePositiveInt(value: unknown, label: string, fallback: number): number {
+  if (value == null) return fallback
+  const n = Number(value)
+  if (!Number.isInteger(n) || n < 1) throw new Error(`Invalid ${label}: ${value}`)
+  return n
+}
 
 // ── Schema helpers ──────────────────────────────────────────────────────────
 
@@ -194,7 +307,7 @@ const TOOLS = [
   {
     name: 'list_all_resources',
     description: 'List all resources across the cluster (VMs, containers, storage, nodes)',
-    inputSchema: { type: 'object' as const, properties: { ...hostParam, type: { type: 'string', enum: ['vm', 'storage', 'node'], description: 'Filter by type (optional)' } }, required: [...hostRequired] },
+    inputSchema: { type: 'object' as const, properties: { ...hostParam, type: { type: 'string', enum: ['vm', 'lxc', 'storage', 'node'], description: 'Filter by type (optional)' } }, required: [...hostRequired] },
   },
 
   // ─── Node ───
@@ -230,7 +343,7 @@ const TOOLS = [
 
   // ─── VM (QEMU) — Power ───
   { name: 'start_vm', description: 'Start a VM', inputSchema: vmSchema() },
-  { name: 'stop_vm', description: 'Force stop a VM (like pulling the power cord)', inputSchema: vmSchema() },
+  { name: 'stop_vm', description: '⚠️ DESTRUCTIVE: Force stop a VM (like pulling the power cord) — may cause data loss. Prefer shutdown_vm for graceful stop.', inputSchema: vmSchema() },
   { name: 'shutdown_vm', description: 'Gracefully shutdown a VM via ACPI', inputSchema: vmSchema() },
   { name: 'reboot_vm', description: 'Reboot a VM', inputSchema: vmSchema() },
   { name: 'suspend_vm', description: 'Suspend a VM to RAM', inputSchema: vmSchema() },
@@ -272,7 +385,7 @@ const TOOLS = [
   },
   {
     name: 'delete_vm',
-    description: 'Delete/destroy a VM and all its data. VM must be stopped first.',
+    description: '⚠️ DESTRUCTIVE & IRREVERSIBLE: Delete/destroy a VM and ALL its data (disks, config). VM must be stopped first. Always confirm with the user before calling this.',
     inputSchema: vmSchema({
       purge: { type: 'boolean', description: 'Also remove from replication and backup jobs (default: false)' },
       'destroy-unreferenced-disks': { type: 'boolean', description: 'Delete unreferenced disks (default: true)' },
@@ -280,7 +393,7 @@ const TOOLS = [
   },
   {
     name: 'convert_vm_to_template',
-    description: 'Convert a VM into a template (irreversible). VM must be stopped.',
+    description: '⚠️ IRREVERSIBLE: Convert a VM into a template — cannot be undone. VM must be stopped. Confirm with user first.',
     inputSchema: vmSchema(),
   },
 
@@ -361,7 +474,7 @@ const TOOLS = [
 
   // ─── Container (LXC) — Power ───
   { name: 'start_container', description: 'Start a container', inputSchema: ctSchema() },
-  { name: 'stop_container', description: 'Force stop a container', inputSchema: ctSchema() },
+  { name: 'stop_container', description: '⚠️ DESTRUCTIVE: Force stop a container — may cause data loss. Prefer shutdown_container.', inputSchema: ctSchema() },
   { name: 'shutdown_container', description: 'Gracefully shutdown a container', inputSchema: ctSchema() },
   { name: 'reboot_container', description: 'Reboot a container', inputSchema: ctSchema() },
 
@@ -400,7 +513,7 @@ const TOOLS = [
   },
   {
     name: 'delete_container',
-    description: 'Delete/destroy a container. Must be stopped first.',
+    description: '⚠️ DESTRUCTIVE & IRREVERSIBLE: Delete/destroy a container and ALL its data. Must be stopped first. Always confirm with the user.',
     inputSchema: ctSchema({
       purge: { type: 'boolean', description: 'Remove from backup/replication jobs' },
       force: { type: 'boolean', description: 'Force destroy even if running' },
@@ -408,7 +521,7 @@ const TOOLS = [
   },
   {
     name: 'convert_container_to_template',
-    description: 'Convert a container into a template (irreversible)',
+    description: '⚠️ IRREVERSIBLE: Convert a container into a template — cannot be undone. Confirm with user first.',
     inputSchema: ctSchema(),
   },
 
@@ -466,7 +579,7 @@ const TOOLS = [
   },
   {
     name: 'rollback_snapshot',
-    description: 'Rollback to a snapshot',
+    description: '⚠️ DESTRUCTIVE: Rollback to a snapshot — all changes since the snapshot will be lost. Confirm with user first.',
     inputSchema: { type: 'object' as const, properties: { ...hostParam, node: { type: 'string', description: 'Node' }, vmid: { type: 'number', description: 'ID' }, type: { type: 'string', enum: ['qemu', 'lxc'], description: 'Type (default: qemu)' }, snapname: { type: 'string', description: 'Snapshot name' } }, required: [...hostRequired, 'node', 'vmid', 'snapname'] },
   },
 
@@ -521,9 +634,9 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
   }
 
   const host = getHost(args.host as string | undefined)
-  const node = args.node as string | undefined
-  const vmid = args.vmid as number | undefined
-  const vmType = (args.type as string) || 'qemu'
+  const node = args.node != null ? validateIdentifier(args.node, 'node') : undefined
+  const vmid = args.vmid != null ? validateVmid(args.vmid) : undefined
+  const vmType = validateVmType(args.type)
   const j = (d: unknown) => JSON.stringify(d, null, 2)
 
   // Collect arbitrary body params (exclude meta keys)
@@ -541,7 +654,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     // ─── Discovery ───
     case 'get_cluster_status': return j(await pveGet(host, '/cluster/status'))
     case 'list_all_resources': {
-      const t = args.type ? `?type=${args.type}` : ''
+      const t = args.type ? `?type=${validateIdentifier(args.type, 'type')}` : ''
       return j(await pveGet(host, `/cluster/resources${t}`))
     }
 
@@ -549,16 +662,16 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     case 'get_node_status': return j(await pveGet(host, `/nodes/${node}/status`))
     case 'list_storage': return j(await pveGet(host, `/nodes/${node}/storage`))
     case 'list_networks': return j(await pveGet(host, `/nodes/${node}/network`))
-    case 'get_node_tasks': return j(await pveGet(host, `/nodes/${node}/tasks?limit=${(args.limit as number) || 20}`))
-    case 'get_node_rrd': return j(await pveGet(host, `/nodes/${node}/rrddata?timeframe=${(args.timeframe as string) || 'hour'}`))
-    case 'list_isos': return j(await pveGet(host, `/nodes/${node}/storage/${args.storage}/content?content=iso`))
-    case 'list_templates': return j(await pveGet(host, `/nodes/${node}/storage/${args.storage}/content?content=vztmpl`))
+    case 'get_node_tasks': return j(await pveGet(host, `/nodes/${node}/tasks?limit=${validatePositiveInt(args.limit, 'limit', 20)}`))
+    case 'get_node_rrd': return j(await pveGet(host, `/nodes/${node}/rrddata?timeframe=${validateTimeframe(args.timeframe)}`))
+    case 'list_isos': return j(await pveGet(host, `/nodes/${node}/storage/${validateIdentifier(args.storage, 'storage')}/content?content=iso`))
+    case 'list_templates': return j(await pveGet(host, `/nodes/${node}/storage/${validateIdentifier(args.storage, 'storage')}/content?content=vztmpl`))
 
     // ─── VM read ───
     case 'list_vms': return j(await pveGet(host, `/nodes/${node}/qemu`))
     case 'get_vm_status': return j(await pveGet(host, `/nodes/${node}/qemu/${vmid}/status/current`))
     case 'get_vm_config': return j(await pveGet(host, `/nodes/${node}/qemu/${vmid}/config`))
-    case 'get_vm_rrd': return j(await pveGet(host, `/nodes/${node}/qemu/${vmid}/rrddata?timeframe=${(args.timeframe as string) || 'hour'}`))
+    case 'get_vm_rrd': return j(await pveGet(host, `/nodes/${node}/qemu/${vmid}/rrddata?timeframe=${validateTimeframe(args.timeframe)}`))
 
     // ─── VM power ───
     case 'start_vm': return j(await pvePost(host, `/nodes/${node}/qemu/${vmid}/status/start`))
@@ -585,21 +698,25 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     // ─── VM exec ───
     case 'exec_vm_command': {
       const cmd = args.command as string
-      const parts = cmd.split(' ')
+      // Wrap in /bin/sh -c so the full shell command is executed correctly
+      // Proxmox agent/exec expects an executable path, not a shell string
       const result = await pvePost(host, `/nodes/${node}/qemu/${vmid}/agent/exec`, {
-        command: parts[0],
-        'input-data': parts.slice(1).join(' '),
+        command: '/bin/sh',
+        'input-data': `${cmd}\n`,
       })
-      // Wait briefly and get output
       const pid = (result as { pid?: number })?.pid
       if (pid !== undefined) {
-        await new Promise(r => setTimeout(r, 2000))
-        try {
-          const output = await pveGet(host, `/nodes/${node}/qemu/${vmid}/agent/exec-status?pid=${pid}`)
-          return j(output)
-        } catch {
-          return j({ pid, note: 'Command started. Use get-exec-status to check result.' })
+        // Poll for completion: 500ms, 1s, 2s, 3s (max ~6.5s)
+        const delays = [500, 1000, 2000, 3000]
+        for (const delay of delays) {
+          await new Promise(r => setTimeout(r, delay))
+          try {
+            const output = await pveGet(host, `/nodes/${node}/qemu/${vmid}/agent/exec-status?pid=${pid}`)
+            const status = output as { exited?: boolean }
+            if (status.exited) return j(output)
+          } catch { /* not ready yet */ }
         }
+        return j({ pid, note: 'Command still running. Poll exec-status manually for result.' })
       }
       return j(result)
     }
@@ -636,19 +753,20 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     // ─── Snapshots ───
     case 'list_snapshots': return j(await pveGet(host, `/nodes/${node}/${vmType}/${vmid}/snapshot`))
     case 'create_snapshot': {
-      const body: Record<string, unknown> = { snapname: args.snapname }
+      const snap = validateIdentifier(args.snapname, 'snapname')
+      const body: Record<string, unknown> = { snapname: snap }
       if (args.description) body.description = args.description
       return j(await pvePost(host, `/nodes/${node}/${vmType}/${vmid}/snapshot`, body))
     }
-    case 'delete_snapshot': return j(await pveDelete(host, `/nodes/${node}/${vmType}/${vmid}/snapshot/${args.snapname}`))
-    case 'rollback_snapshot': return j(await pvePost(host, `/nodes/${node}/${vmType}/${vmid}/snapshot/${args.snapname}/rollback`))
+    case 'delete_snapshot': return j(await pveDelete(host, `/nodes/${node}/${vmType}/${vmid}/snapshot/${validateIdentifier(args.snapname, 'snapname')}`))
+    case 'rollback_snapshot': return j(await pvePost(host, `/nodes/${node}/${vmType}/${vmid}/snapshot/${validateIdentifier(args.snapname, 'snapname')}/rollback`))
 
     // ─── Backups ───
     case 'list_backups': {
-      const filter = args.vmid ? `&vmid=${args.vmid}` : ''
-      return j(await pveGet(host, `/nodes/${node}/storage/${args.storage}/content?content=backup${filter}`))
+      const filter = vmid ? `&vmid=${vmid}` : ''
+      return j(await pveGet(host, `/nodes/${node}/storage/${validateIdentifier(args.storage, 'storage')}/content?content=backup${filter}`))
     }
-    case 'backup_vm': return j(await pvePost(host, `/nodes/${node}/vzdump`, bodyFrom(args)))
+    case 'backup_vm': return j(await pvePost(host, `/nodes/${node}/vzdump`, { vmid, ...bodyFrom(args) }))
 
     // ─── Firewall ───
     case 'list_firewall_rules': return j(await pveGet(host, `/nodes/${node}/${vmType}/${vmid}/firewall/rules`))
@@ -661,19 +779,33 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 // ── MCP Server setup ────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'proxmox-mcp-server', version: '0.2.0' },
+  { name: 'proxmox-mcp-server', version: '0.1.0' },
   { capabilities: { tools: {} } },
 )
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: readOnly ? TOOLS.filter(t => !WRITE_TOOLS.has(t.name)) : TOOLS,
+}))
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params
+  const ts = new Date().toISOString()
+  const safeArgs = { ...args as Record<string, unknown> }
+  delete safeArgs.password // never log secrets
+  process.stderr.write(`[${ts}] tool=${name} args=${JSON.stringify(safeArgs)}\n`)
+
+  if (readOnly && WRITE_TOOLS.has(name)) {
+    const msg = `PROXMOX_READ_ONLY is enabled — tool "${name}" is blocked. Only read operations are allowed.`
+    process.stderr.write(`[${ts}] BLOCKED (read-only): ${name}\n`)
+    return { content: [{ type: 'text', text: msg }], isError: true }
+  }
+
   try {
     const result = await handleTool(name, args as Record<string, unknown>)
     return { content: [{ type: 'text', text: result }] }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`[${ts}] ERROR tool=${name}: ${message}\n`)
     return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true }
   }
 })
@@ -682,4 +814,5 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport()
 await server.connect(transport)
-process.stderr.write(`proxmox-mcp-server: connected (${hosts.length} host(s): ${hostNames.join(', ')})\n`)
+const mode = readOnly ? ', READ-ONLY' : ''
+process.stderr.write(`proxmox-mcp-server: connected (${hosts.length} host(s): ${hostNames.join(', ')}${mode})\n`)

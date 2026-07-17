@@ -195,10 +195,19 @@ async function pveApiFetch(baseUrl: string, host: PveHost, method: string, path:
     bodyStr = new URLSearchParams(
       Object.entries(body).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => [k, String(v)])
     ).toString()
+    headers['Content-Length'] = Buffer.byteLength(bodyStr).toString()
   }
 
   const res = await pveRequest(url, method, headers, bodyStr)
-  const json = JSON.parse(res.body) as { data?: unknown; errors?: unknown }
+  let json: { data?: unknown; errors?: unknown }
+  try {
+    json = JSON.parse(res.body) as { data?: unknown; errors?: unknown }
+  } catch {
+    // Proxmox sometimes returns non-JSON (e.g. chunked encoding artifacts)
+    // Treat as success if status 2xx, with raw body as data
+    process.stderr.write(`proxmox-mcp-server: non-JSON response [${res.status}] ${method} ${path}: ${res.body.slice(0, 200)}\n`)
+    return { ok: res.ok, data: res.body || null, status: res.status, raw: res.body }
+  }
   return { ok: res.ok, data: json.data, status: res.status, raw: JSON.stringify(json.errors ?? json) }
 }
 
@@ -682,7 +691,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     case 'resume_vm': return j(await pvePost(host, `/nodes/${node}/qemu/${vmid}/status/resume`))
 
     // ─── VM create/clone/delete ───
-    case 'create_vm': return j(await pvePost(host, `/nodes/${node}/qemu`, bodyFrom(args)))
+    case 'create_vm': return j(await pvePost(host, `/nodes/${node}/qemu`, { vmid, ...bodyFrom(args) }))
     case 'clone_vm': return j(await pvePost(host, `/nodes/${node}/qemu/${vmid}/clone`, bodyFrom(args)))
     case 'delete_vm': return j(await pveDelete(host, `/nodes/${node}/qemu/${vmid}?${new URLSearchParams(Object.entries(bodyFrom(args)).map(([k, v]) => [k, String(v)])).toString()}`))
     case 'convert_vm_to_template': return j(await pvePost(host, `/nodes/${node}/qemu/${vmid}/template`))
